@@ -9,12 +9,26 @@ refresh_status:
         text:
 clear_tokens:
   description: "Clear the cached tokens"
+  fields:
+    vin:
+      name: Vin
+      description: "Optional VIN to clear tokens for one configured vehicle (default applies to all)"
+      example: "1C4GJ25342B521742"
+      selector:
+        text:
 reload:
   name: Reload
   description: "Reload the Fordpass Integration"
 poll_api:
   name: Poll API
   description: "Manually poll API for data update (Warning: doing this too often could result in a ban)"
+  fields:
+    vin:
+      name: Vin
+      description: "Optional VIN to poll only one configured vehicle (default polls all)"
+      example: "1C4GJ25342B521742"
+      selector:
+        text:
 delete_message:
   name: "Delete FordPass Message"
   description: "Delete a Message from the Messages list. Enter a Message ID to delete a specific message"
@@ -26,11 +40,26 @@ delete_message:
       selector:
         text:
           multiline: false
+    vin:
+      name: Vin
+      description: "Optional VIN to target one configured vehicle/account context (default uses all)"
+      example: "1C4GJ25342B521742"
+      selector:
+        text:
+          multiline: false
 
 update_departure_schedule:
   name: "Update Departure Schedule"
   description: "Set a departure schedule time and preconditioning temperature for selected days"
   fields:
+    vin:
+      name: "Vin"
+      description: "Optional VIN to target one vehicle (default applies to all supported vehicles)"
+      required: false
+      example: "1C4GJ25342B521742"
+      selector:
+        text:
+          multiline: false
     hour:
       name: "Hour"
       description: "Departure hour (0-23)"
@@ -88,6 +117,14 @@ delete_departure_schedule_by_days:
   name: "Delete Departure Schedules by Days"
   description: "Delete departure schedules for selected weekdays"
   fields:
+    vin:
+      name: "Vin"
+      description: "Optional VIN to target one vehicle (default applies to all supported vehicles)"
+      required: false
+      example: "1C4GJ25342B521742"
+      selector:
+        text:
+          multiline: false
     schedule_days:
       name: "Days"
       description: "Select one or more weekdays"
@@ -110,6 +147,14 @@ delete_departure_schedule_by_ids:
   name: "Delete Departure Schedules by IDs"
   description: "Delete departure schedules by schedule IDs"
   fields:
+    vin:
+      name: "Vin"
+      description: "Optional VIN to target one vehicle (default applies to all supported vehicles)"
+      required: false
+      example: "1C4GJ25342B521742"
+      selector:
+        text:
+          multiline: false
     schedule_ids:
       name: "Schedule IDs"
       description: "Provide one or more schedule IDs as list (e.g. [1,2,3]) or comma-separated string (e.g. 1,2,3)"
