@@ -68,6 +68,16 @@ _LOGGER = logging.getLogger(__name__)
 CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({})}, extra=vol.ALLOW_EXTRA)
 PLATFORMS:Final = [Platform.BUTTON, Platform.LOCK, Platform.NUMBER, Platform.SENSOR, Platform.SWITCH, Platform.SELECT, Platform.DEVICE_TRACKER]
 WEBSOCKET_WATCHDOG_INTERVAL: Final = timedelta(seconds=64)
+SERVICE_NAMES: Final = [
+    "refresh_status",
+    "clear_tokens",
+    "poll_api",
+    "reload",
+    "delete_message",
+    "update_departure_schedule",
+    "delete_departure_schedule_by_days",
+    "delete_departure_schedule_by_ids",
+]
 
 
 async def async_setup(hass: HomeAssistant, config: dict):
@@ -119,6 +129,300 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
             _LOGGER.info(f"async_migrate_entry(): Migration to configuration version {config_entry.version}.{config_entry.minor_version} successful")
 
     return True
+
+
+def _is_supported_entry(entry: ConfigEntry) -> bool:
+    return CONF_IS_SUPPORTED in entry.data and entry.data.get(CONF_REGION) in REGIONS
+
+
+def _iter_active_coordinators(hass: HomeAssistant):
+    if DOMAIN not in hass.data:
+        return []
+
+    coordinators = []
+    for key, value in hass.data[DOMAIN].items():
+        if key in ["manifest_version", "services_registered"]:
+            continue
+        if isinstance(value, dict) and COORDINATOR_KEY in value:
+            coordinators.append(value[COORDINATOR_KEY])
+    return coordinators
+
+
+def _get_target_coordinators(hass: HomeAssistant, vin: str | None = None, require_departure_support: bool = False):
+    coordinators = _iter_active_coordinators(hass)
+    if vin is not None:
+        vin = vin.strip().upper()
+        coordinators = [coordinator for coordinator in coordinators if coordinator._vin.upper() == vin]
+
+    if require_departure_support:
+        coordinators = [coordinator for coordinator in coordinators if coordinator.tag_supported_by_vehicle(Tag.DEPARTURE_SCHEDULES)]
+
+    return coordinators
+
+
+def _has_multi_vehicle_account(hass: HomeAssistant, username: str, region_key: str) -> bool:
+    return len([
+        entry for entry in hass.config_entries.async_entries(DOMAIN)
+        if _is_supported_entry(entry)
+        and entry.data.get(CONF_USERNAME) == username
+        and entry.data.get(CONF_REGION) == region_key
+    ]) > 1
+
+
+async def _register_services(hass: HomeAssistant):
+    if DOMAIN not in hass.data:
+        return
+
+    if hass.data[DOMAIN].get("services_registered", False):
+        return
+
+    async def async_refresh_status_service(call: ServiceCall):
+        _LOGGER.debug(f"Running Service 'refresh_status'")
+        vin = call.data.get("vin")
+        coordinators = _get_target_coordinators(hass, vin=vin)
+        if len(coordinators) == 0:
+            _LOGGER.warning(f"refresh_status: no configured vehicle found for VIN '{vin}'")
+            return False
+
+        for a_coordinator in coordinators:
+            status = await a_coordinator.bridge.request_update()
+            if status == 401:
+                _LOGGER.debug(f"{a_coordinator.vli}refresh_status: Invalid VIN?! (status 401)")
+            elif status in [200, 201, 202]:
+                _LOGGER.debug(f"{a_coordinator.vli}refresh_status: Refresh sent")
+
+        await asyncio.sleep(10)
+        await asyncio.gather(*[
+            a_coordinator.async_request_refresh_force_classic_requests()
+            for a_coordinator in coordinators
+        ])
+        return True
+
+    async def async_clear_tokens_service(call: ServiceCall):
+        """Clear token files in config directory, only use in emergency."""
+        _LOGGER.debug(f"Running Service 'clear_tokens'")
+        vin = call.data.get("vin")
+        coordinators = _get_target_coordinators(hass, vin=vin)
+        if len(coordinators) == 0:
+            _LOGGER.warning(f"clear_tokens: no configured vehicle found for VIN '{vin}'")
+            return False
+
+        for a_coordinator in coordinators:
+            a_coordinator.bridge.clear_token()
+
+        await asyncio.sleep(5)
+        await asyncio.gather(*[
+            a_coordinator.async_request_refresh_force_classic_requests()
+            for a_coordinator in coordinators
+        ])
+        return True
+
+    async def poll_api_service(call: ServiceCall):
+        vin = call.data.get("vin")
+        coordinators = _get_target_coordinators(hass, vin=vin)
+        if len(coordinators) == 0:
+            _LOGGER.warning(f"poll_api: no configured vehicle found for VIN '{vin}'")
+            return False
+        await asyncio.gather(*[
+            a_coordinator.async_request_refresh_force_classic_requests()
+            for a_coordinator in coordinators
+        ])
+        return True
+
+    async def handle_reload_service(call: ServiceCall):
+        """Handle reload service call."""
+        _LOGGER.debug(f"Reloading Integration")
+        current_entries = [
+            entry for entry in hass.config_entries.async_entries(DOMAIN)
+            if _is_supported_entry(entry)
+        ]
+        await asyncio.gather(*[
+            hass.config_entries.async_reload(entry.entry_id)
+            for entry in current_entries
+        ])
+        return True
+
+    async def async_delete_message_service(call: ServiceCall):
+        _LOGGER.debug(f"Running Service 'delete_message'")
+        msg_id = call.data.get("msgid", None)
+        vin = call.data.get("vin")
+        if msg_id is None:
+            _LOGGER.warning(f"async_delete_message_service: No 'msgid' was provided!")
+            return False
+
+        try:
+            msg_id = int(msg_id)
+        except ValueError:
+            _LOGGER.warning(f"async_delete_message_service: provided 'msgid' can not be convert to a number: {type(msg_id).__name__} - {msg_id}")
+            return False
+
+        coordinators = _get_target_coordinators(hass, vin=vin)
+        if len(coordinators) == 0:
+            _LOGGER.warning(f"delete_message: no configured vehicle found for VIN '{vin}'")
+            return False
+
+        processed_accounts = set()
+        for a_coordinator in coordinators:
+            if a_coordinator.account_key in processed_accounts:
+                continue
+            processed_accounts.add(a_coordinator.account_key)
+            if await FordpassDataHandler.messages_delete_with_id_called_from_service(a_coordinator, msg_id):
+                return True
+        return False
+
+    async def async_update_departure_schedule_service(call: ServiceCall):
+        _LOGGER.debug(f"Running Service 'update_departure_schedule'")
+
+        hour = call.data.get("hour", None)
+        minute = call.data.get("minute", None)
+        precon_temperature = str(call.data.get("precondition_temperature", "OFF")).upper()
+        days = call.data.get("schedule_days", [])
+        vin = call.data.get("vin")
+
+        if hour is None or minute is None:
+            _LOGGER.warning("async_update_departure_schedule_service(): 'hour' and 'minute' are required")
+            return False
+
+        if isinstance(days, str):
+            days = [days]
+        elif not isinstance(days, list):
+            _LOGGER.warning(f"async_update_departure_schedule_service(): invalid 'days' format: {type(days).__name__}")
+            return False
+
+        validated_days = []
+        for day in days:
+            day_name = str(day).upper()
+            if day_name in DAYS_MAP:
+                validated_days.append(day_name)
+
+        if len(validated_days) == 0:
+            _LOGGER.warning("async_update_departure_schedule_service(): No valid days were provided")
+            return False
+
+        if precon_temperature not in ["LOW", "MEDIUM", "HIGH", "OFF"]:
+            _LOGGER.warning(f"async_update_departure_schedule_service(): invalid precon_temperature '{precon_temperature}' - fallback to OFF")
+            precon_temperature = "OFF"
+
+        coordinators = _get_target_coordinators(hass, vin=vin, require_departure_support=True)
+        if len(coordinators) == 0:
+            _LOGGER.warning(f"async_update_departure_schedule_service(): no departure-schedule capable vehicle found for VIN '{vin}'")
+            return False
+
+        try:
+            await asyncio.gather(*[
+                FordpassDataHandler.update_departure_schedule(a_coordinator.data, a_coordinator.bridge, validated_days, int(hour), int(minute), precon_temperature)
+                for a_coordinator in coordinators
+            ])
+        except ValueError:
+            _LOGGER.warning(f"async_update_departure_schedule_service(): invalid hour/minute values: hour={hour}, minute={minute}")
+            return False
+
+        return True
+
+    async def async_delete_departure_schedule_by_days_service(call: ServiceCall):
+        _LOGGER.debug(f"Running Service 'delete_departure_schedule_by_days'")
+
+        days = call.data.get("schedule_days", [])
+        vin = call.data.get("vin")
+        if isinstance(days, str):
+            days = [days]
+        elif not isinstance(days, list):
+            _LOGGER.warning(f"async_delete_departure_schedule_by_days_service(): invalid 'schedule_days' format: {type(days).__name__}")
+            return False
+
+        validated_days = []
+        for day in days:
+            day_name = str(day).upper()
+            if day_name in DAYS_MAP:
+                validated_days.append(day_name)
+
+        if len(validated_days) == 0:
+            _LOGGER.warning("async_delete_departure_schedule_by_days_service(): No valid days were provided")
+            return False
+
+        coordinators = _get_target_coordinators(hass, vin=vin, require_departure_support=True)
+        if len(coordinators) == 0:
+            _LOGGER.warning(f"async_delete_departure_schedule_by_days_service(): no departure-schedule capable vehicle found for VIN '{vin}'")
+            return False
+
+        try:
+            await asyncio.gather(*[
+                FordpassDataHandler.delete_departure_schedule_by_days(a_coordinator.data, a_coordinator.bridge, validated_days)
+                for a_coordinator in coordinators
+            ])
+        except ValueError:
+            _LOGGER.warning(f"async_delete_departure_schedule_by_days_service(): invalid values: validated_days={validated_days}")
+            return False
+
+        return True
+
+    async def async_delete_departure_schedule_by_ids_service(call: ServiceCall):
+        _LOGGER.debug(f"Running Service 'delete_departure_schedule_by_ids'")
+
+        raw_ids = call.data.get("schedule_ids", [])
+        vin = call.data.get("vin")
+        if isinstance(raw_ids, int):
+            schedule_ids = [raw_ids]
+        elif isinstance(raw_ids, str):
+            parts = [p.strip() for p in raw_ids.split(",") if p.strip()]
+            try:
+                schedule_ids = [int(p) for p in parts]
+            except ValueError:
+                _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid 'schedule_ids' string: {raw_ids}")
+                return False
+        elif isinstance(raw_ids, list):
+            schedule_ids = []
+            for value in raw_ids:
+                try:
+                    schedule_ids.append(int(value))
+                except (TypeError, ValueError):
+                    _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid schedule id value: {value}")
+                    return False
+        else:
+            _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid 'schedule_ids' format: {type(raw_ids).__name__}")
+            return False
+
+        if len(schedule_ids) == 0:
+            _LOGGER.warning("async_delete_departure_schedule_by_ids_service(): No schedule IDs were provided")
+            return False
+
+        coordinators = _get_target_coordinators(hass, vin=vin, require_departure_support=True)
+        if len(coordinators) == 0:
+            _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): no departure-schedule capable vehicle found for VIN '{vin}'")
+            return False
+
+        try:
+            await asyncio.gather(*[
+                FordpassDataHandler.delete_departure_schedule_by_schedule_ids(a_coordinator.data, a_coordinator.bridge, schedule_ids)
+                for a_coordinator in coordinators
+            ])
+        except ValueError:
+            _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid values: schedule_ids={schedule_ids}")
+            return False
+
+        return True
+
+    hass.services.async_register(DOMAIN, "refresh_status", async_refresh_status_service)
+    hass.services.async_register(DOMAIN, "clear_tokens", async_clear_tokens_service)
+    hass.services.async_register(DOMAIN, "poll_api", poll_api_service)
+    hass.services.async_register(DOMAIN, "reload", handle_reload_service)
+    hass.services.async_register(DOMAIN, "delete_message", async_delete_message_service)
+    hass.services.async_register(DOMAIN, "update_departure_schedule", async_update_departure_schedule_service)
+    hass.services.async_register(DOMAIN, "delete_departure_schedule_by_days", async_delete_departure_schedule_by_days_service)
+    hass.services.async_register(DOMAIN, "delete_departure_schedule_by_ids", async_delete_departure_schedule_by_ids_service)
+    hass.data[DOMAIN]["services_registered"] = True
+
+
+def _unregister_services_if_needed(hass: HomeAssistant):
+    if len(_iter_active_coordinators(hass)) > 0:
+        return
+
+    for service_name in SERVICE_NAMES:
+        if hass.services.has_service(DOMAIN, service_name):
+            hass.services.async_remove(DOMAIN, service_name)
+
+    if DOMAIN in hass.data:
+        hass.data[DOMAIN]["services_registered"] = False
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     """Set up FordPass from a config entry."""
@@ -172,7 +476,20 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
         _LOGGER.debug(f"[@{vin}] cant get region for key: {CONF_REGION} in {config_entry.data.keys()} using default: '{DEFAULT_REGION_FORD}'")
         region_key = DEFAULT_REGION_FORD
 
-    coordinator = FordPassDataUpdateCoordinator(hass, config_entry, user, vin, region_key, update_interval_as_int=update_interval_as_int, save_token=True)
+    use_websocket = not _has_multi_vehicle_account(hass, user, region_key)
+    if not use_websocket:
+        _LOGGER.info(f"[@{vin}] Multiple vehicles detected for account '{user}' in region '{region_key}' - websocket disabled for this vehicle, falling back to polling.")
+
+    coordinator = FordPassDataUpdateCoordinator(
+        hass,
+        config_entry,
+        user,
+        vin,
+        region_key,
+        update_interval_as_int=update_interval_as_int,
+        save_token=True,
+        websocket_enabled=use_websocket,
+    )
     await coordinator.bridge._rename_token_file_if_needed(user)
 
     # HA can check if we can make an initial data refresh and report the state
@@ -209,12 +526,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     else:
         await coordinator.read_config_on_startup(hass)
 
-    # ws watchdog...
-    if hass.state is CoreState.running:
-        await coordinator.start_watchdog()
-    else:
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, coordinator.start_watchdog)
-
     if not config_entry.options:
         await async_update_options(hass, config_entry)
 
@@ -222,181 +533,19 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
         COORDINATOR_KEY: coordinator
     }
 
-    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    if not use_websocket:
+        for a_coordinator in _iter_active_coordinators(hass):
+            if a_coordinator != coordinator and a_coordinator.account_key == coordinator.account_key:
+                await a_coordinator.disable_websocket_mode()
 
-    # SERVICES from here...
-    # simple service implementations (might be moved to separate service.py)
-    async def async_refresh_status_service(call: ServiceCall):
-        _LOGGER.debug(f"Running Service 'refresh_status'")
-        status = await coordinator.bridge.request_update()
-        if status == 401:
-            _LOGGER.debug(f"[@{coordinator.vli}] refresh_status: Invalid VIN?! (status 401)")
-        elif status in [200, 201, 202]:
-            _LOGGER.debug(f"[@{coordinator.vli}] refresh_status: Refresh sent")
-
-        await asyncio.sleep(10)
-        await coordinator.async_request_refresh_force_classic_requests()
-
-    async def async_clear_tokens_service(call: ServiceCall):
-        #await hass.async_add_executor_job(service_clear_tokens, hass, call, coordinator)
-        """Clear the token file in config directory, only use in emergency"""
-        _LOGGER.debug(f"Running Service 'clear_tokens'")
-        await coordinator.bridge.clear_token()
-        await asyncio.sleep(5)
-        await coordinator.async_request_refresh_force_classic_requests()
-
-    async def poll_api_service(call: ServiceCall):
-        await coordinator.async_request_refresh_force_classic_requests()
-
-    async def handle_reload_service(call: ServiceCall):
-        """Handle reload service call."""
-        _LOGGER.debug(f"Reloading Integration")
-
-        current_entries = hass.config_entries.async_entries(DOMAIN)
-        reload_tasks = [
-            hass.config_entries.async_reload(entry.entry_id)
-            for entry in current_entries
-        ]
-
-        await asyncio.gather(*reload_tasks)
-
-    async def async_delete_message_service(call: ServiceCall):
-        _LOGGER.debug(f"Running Service 'delete_message'")
-        msg_id = call.data.get('msgid', None)
-        if msg_id is not None:
-            try:
-                return await FordpassDataHandler.messages_delete_with_id_called_from_service(coordinator, int(msg_id))
-            except ValueError:
-                _LOGGER.warning(f"async_delete_message_service: provided 'msgid' can not be convert to a number: {type(msg_id).__name__} - {msg_id}")
-                return False
-        else:
-            _LOGGER.warning(f"async_delete_message_service: No 'msgid' was provided!")
-            return False
-
-    async def async_update_departure_schedule_service(call: ServiceCall):
-        _LOGGER.debug(f"Running Service 'update_departure_schedule'")
-
-        hour = call.data.get("hour", None)
-        minute = call.data.get("minute", None)
-        precon_temperature = str(call.data.get("precondition_temperature", "OFF")).upper()
-        days = call.data.get("schedule_days", [])
-
-        if hour is None or minute is None:
-            _LOGGER.warning("async_update_departure_schedule_service(): 'hour' and 'minute' are required")
-            return False
-
-        if isinstance(days, str):
-            days = [days]
-        elif not isinstance(days, list):
-            _LOGGER.warning(f"async_update_departure_schedule_service(): invalid 'days' format: {type(days).__name__}")
-            return False
-
-        validated_days = []
-        for day in days:
-            day_name = str(day).upper()
-            if day_name in DAYS_MAP:
-                validated_days.append(day_name)
-
-        if len(validated_days) == 0:
-            _LOGGER.warning("async_update_departure_schedule_service(): No valid days were provided")
-            return False
-
-        if precon_temperature not in ["LOW", "MEDIUM", "HIGH", "OFF"]:
-            _LOGGER.warning(f"async_update_departure_schedule_service(): invalid precon_temperature '{precon_temperature}' - fallback to OFF")
-            precon_temperature = "OFF"
-
-        try:
-            await FordpassDataHandler.update_departure_schedule(coordinator.data, coordinator.bridge,
-                validated_days, int(hour), int(minute), precon_temperature
-            )
-        except ValueError:
-            _LOGGER.warning(f"async_update_departure_schedule_service(): invalid hour/minute values: hour={hour}, minute={minute}")
-            return False
-
-        #await asyncio.sleep(2)
-        #await coordinator.async_request_refresh_force_classic_requests()
-        return True
-
-    async def async_delete_departure_schedule_by_days_service(call: ServiceCall):
-        _LOGGER.debug(f"Running Service 'delete_departure_schedule_by_days'")
-
-        days = call.data.get("schedule_days", [])
-        if isinstance(days, str):
-            days = [days]
-        elif not isinstance(days, list):
-            _LOGGER.warning(f"async_delete_departure_schedule_by_days_service(): invalid 'schedule_days' format: {type(days).__name__}")
-            return False
-
-        validated_days = []
-        for day in days:
-            day_name = str(day).upper()
-            if day_name in DAYS_MAP:
-                validated_days.append(day_name)
-
-        if len(validated_days) == 0:
-            _LOGGER.warning("async_delete_departure_schedule_by_days_service(): No valid days were provided")
-            return False
-
-        try:
-            await FordpassDataHandler.delete_departure_schedule_by_days(coordinator.data, coordinator.bridge,
-                validated_days
-            )
-        except ValueError:
-            _LOGGER.warning(f"async_delete_departure_schedule_by_days_service(): invalid values: validated_days={validated_days}")
-            return False
-
-        return True
-
-    async def async_delete_departure_schedule_by_ids_service(call: ServiceCall):
-        _LOGGER.debug(f"Running Service 'delete_departure_schedule_by_ids'")
-
-        raw_ids = call.data.get("schedule_ids", [])
-        if isinstance(raw_ids, int):
-            schedule_ids = [raw_ids]
-        elif isinstance(raw_ids, str):
-            parts = [p.strip() for p in raw_ids.split(",") if p.strip()]
-            try:
-                schedule_ids = [int(p) for p in parts]
-            except ValueError:
-                _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid 'schedule_ids' string: {raw_ids}")
-                return False
-        elif isinstance(raw_ids, list):
-            schedule_ids = []
-            for value in raw_ids:
-                try:
-                    schedule_ids.append(int(value))
-                except (TypeError, ValueError):
-                    _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid schedule id value: {value}")
-                    return False
-        else:
-            _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid 'schedule_ids' format: {type(raw_ids).__name__}")
-            return False
-
-        if len(schedule_ids) == 0:
-            _LOGGER.warning("async_delete_departure_schedule_by_ids_service(): No schedule IDs were provided")
-            return False
-
-        try:
-            await FordpassDataHandler.delete_departure_schedule_by_schedule_ids(coordinator.data, coordinator.bridge,
-                schedule_ids
-            )
-        except ValueError:
-            _LOGGER.warning(f"async_delete_departure_schedule_by_ids_service(): invalid values: schedule_ids={schedule_ids}")
-            return False
-
-        return True
-
-    hass.services.async_register(DOMAIN, "refresh_status", async_refresh_status_service)
-    hass.services.async_register(DOMAIN, "clear_tokens", async_clear_tokens_service)
-    hass.services.async_register(DOMAIN, "poll_api", poll_api_service)
-    hass.services.async_register(DOMAIN, "reload", handle_reload_service)
-    hass.services.async_register(DOMAIN, "delete_message", async_delete_message_service)
-    if coordinator.tag_supported_by_vehicle(Tag.DEPARTURE_SCHEDULES):
-        hass.services.async_register(DOMAIN, "update_departure_schedule", async_update_departure_schedule_service)
-        hass.services.async_register(DOMAIN, "delete_departure_schedule_by_days", async_delete_departure_schedule_by_days_service)
-        hass.services.async_register(DOMAIN, "delete_departure_schedule_by_ids", async_delete_departure_schedule_by_ids_service)
+    # ws watchdog...
+    if hass.state is CoreState.running:
+        await coordinator.start_watchdog()
     else:
-        _LOGGER.debug(f"{coordinator.vli}Service 'departure_schedule services' will NOT be registered since this vehicle does not support departure schedules")
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, coordinator.start_watchdog)
+
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    await _register_services(hass)
 
     config_entry.async_on_unload(config_entry.add_update_listener(entry_update_listener))
     return True
@@ -428,16 +577,7 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
             coordinator.stop_watchdog()
             await coordinator.clear_data()
             hass.data[DOMAIN].pop(config_entry.entry_id)
-            if coordinator.tag_supported_by_vehicle(Tag.DEPARTURE_SCHEDULES):
-                hass.services.async_remove(DOMAIN, "update_departure_schedule")
-                hass.services.async_remove(DOMAIN, "delete_departure_schedule_by_days")
-                hass.services.async_remove(DOMAIN, "delete_departure_schedule_by_ids")
-
-        hass.services.async_remove(DOMAIN, "refresh_status")
-        hass.services.async_remove(DOMAIN, "clear_tokens")
-        hass.services.async_remove(DOMAIN, "poll_api")
-        hass.services.async_remove(DOMAIN, "reload")
-        hass.services.async_remove(DOMAIN, "delete_message")
+        _unregister_services_if_needed(hass)
 
     return unload_ok
 
@@ -474,10 +614,11 @@ class FordPassDataUpdateCoordinator(DataUpdateCoordinator):
     """DataUpdateCoordinator to handle fetching new data about the vehicle."""
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry,
-                 user, vin, region_key, update_interval_as_int:int, save_token=False):
+                 user, vin, region_key, update_interval_as_int:int, save_token=False, websocket_enabled: bool = True):
         """Initialize the coordinator and set up the Vehicle object."""
         self._config_entry = config_entry
         self._vin = vin
+        self.account_key = f"{user}µ@µ{region_key}"
         self.vli = f"[@{self._vin}] "
 
         lang = hass.config.language.lower()
@@ -539,6 +680,7 @@ class FordPassDataUpdateCoordinator(DataUpdateCoordinator):
         self._watchdog = None
         self._a_task = None
         self._force_classic_requests = False
+        self._websocket_enabled = websocket_enabled
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=update_interval_as_int))
 
     def get_new_client_session(self, vin: str) -> aiohttp.ClientSession:
@@ -549,6 +691,9 @@ class FordPassDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def start_watchdog(self, event=None):
         """Start websocket watchdog."""
+        if not self._websocket_enabled:
+            _LOGGER.debug(f"{self.vli}start_watchdog(): websocket disabled")
+            return
         await self._async_watchdog_check()
         self._watchdog = async_track_time_interval(
             self.hass,
@@ -559,6 +704,19 @@ class FordPassDataUpdateCoordinator(DataUpdateCoordinator):
     def stop_watchdog(self):
         if hasattr(self, "_watchdog") and self._watchdog is not None:
             self._watchdog()
+            self._watchdog = None
+
+    @property
+    def websocket_enabled(self) -> bool:
+        return self._websocket_enabled
+
+    async def disable_websocket_mode(self):
+        if not self._websocket_enabled:
+            return
+        self._websocket_enabled = False
+        self.stop_watchdog()
+        self._check_for_ws_task_and_cancel_if_running()
+        _LOGGER.info(f"{self.vli}Websocket disabled due to multi-vehicle account setup - using polling updates.")
 
     def _check_for_ws_task_and_cancel_if_running(self):
         if self._a_task is not None and not self._a_task.done():
@@ -580,6 +738,8 @@ class FordPassDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_watchdog_check(self, *_):
         """Reconnect the websocket if it fails."""
+        if not self._websocket_enabled:
+            return
         await self._check_for_reauth()
 
         if not self.bridge.ws_connected:

@@ -198,16 +198,11 @@ If accepting the invitation doesn't work or results in a blank screen in the For
 
 ## Multi-Vehicle Support
 
-When you have __multiple__ vehicles registered in your FordPass™/The Lincoln Way™ account, then in the FordPass™/The Lincoln Way™ App you must first select the vehicle you want to use, before you can access any data or functionality of this vehicle. __The same limitation is also true__ for this Home Assistant integration.
+When you have __multiple__ vehicles linked to the same FordPass™/The Lincoln Way™ account, you can add each vehicle as its own integration entry in Home Assistant.
 
-The main reason for this restriction is the fact that the FordPass™ App and this integration make use of a websocket connection to the Ford backend, which is some sort of bound to a single vehicle at a time.
+When the integration detects multiple vehicles for the same account+region, it automatically falls back from websocket updates to polling updates for that account's vehicles. This avoids backend websocket conflicts and keeps all configured vehicles updating.
 
-So you have three options to use multiple vehicles in Home Assistant with this integration:
-1. **Use multiple FordPass™ accounts**: You can create a separate FordPass™ account for each of your vehicles and then add each account as a separate integration in Home Assistant. This way you can use multiple vehicles in Home Assistant that do not have any influence on each other [my personal recommendation].
-
-2. **Use different Regions**: If you have multiple vehicles, you can create for each of the vehicles a separate Region (and create a new access token per Region).
-
-3. **Have _only one_ vehicle _active_ in Home Assistant**: If you have multiple vehicles in your FordPass™ account, you can activate only use one of the vehicles at a time in Home Assistant. This means that you must first deactivate the current active vehicle in HA (deactivate the device) and then activate the new vehicle you want to use. This approach is quite similar to the way how FordPass™ App deals with multiple vehicles in your FordPass™ account, but probably that's not what you want.
+Service calls now also support targeting a specific VIN (and default to all configured vehicles when no VIN is provided).
 
 
 ## Services
